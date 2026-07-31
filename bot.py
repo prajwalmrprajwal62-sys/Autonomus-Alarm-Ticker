@@ -1,20 +1,19 @@
 """
-RoutineBot — Phase 2 (fixed)
+RoutineBot — Phase 2 (Turso edition)
 Morning routine + daily study task tracking with carry-forward.
 
-Fixes in this version:
-  - day_type now persists in DB (survives restarts)
-  - afternoon check-in shows both 'pending' AND 'not_done' tasks
-  - /testevening — manually fire evening report, no waiting for clock
-  - /resetday — wipe today's log + tasks, for clean re-testing
+Storage: Turso (cloud-hosted libSQL, SQLite-compatible).
+Data now lives in the cloud, not a local file — Render restarts/
+redeploys no longer wipe your history. Same code runs locally and
+on Render; only the .env values differ.
 """
 
 import logging
 import os
-import sqlite3
 from datetime import time, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import libsql
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -55,133 +54,155 @@ DAILY_STUDY_TASKS = [
 logging.basicConfig(format="%(asctime)s  %(levelname)s  %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN   = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+TOKEN       = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID     = int(os.getenv("CHAT_ID", "0"))
+TURSO_URL   = os.getenv("TURSO_DATABASE_URL")
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 
 # ──────────────────────────────────────────────────────
-# DATABASE
+# DATABASE (Turso — one persistent connection for the bot's lifetime)
 # ──────────────────────────────────────────────────────
+_conn = None
+
+
+def get_conn():
+    """Lazily open (and reuse) the connection to your Turso database."""
+    global _conn
+    if _conn is None:
+        _conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+    return _conn
+
+
 def init_db() -> None:
-    with sqlite3.connect("routine.db") as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS daily_log (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                date      TEXT NOT NULL,
-                step_name TEXT NOT NULL,
-                status    TEXT NOT NULL,
-                logged_at TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS study_tasks (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                date          TEXT NOT NULL,
-                task_name     TEXT NOT NULL,
-                duration_mins INTEGER NOT NULL,
-                status        TEXT NOT NULL DEFAULT 'pending',
-                original_date TEXT NOT NULL
-            )
-        """)
-        # NEW: simple key-value table so settings survive restarts
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS bot_config (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
+    conn = get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_log (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            date      TEXT NOT NULL,
+            step_name TEXT NOT NULL,
+            status    TEXT NOT NULL,
+            logged_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS study_tasks (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            date          TEXT NOT NULL,
+            task_name     TEXT NOT NULL,
+            duration_mins INTEGER NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            original_date TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_config (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    conn.commit()
 
 
 def set_config(key: str, value: str) -> None:
-    with sqlite3.connect("routine.db") as conn:
-        conn.execute(
-            "INSERT INTO bot_config (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO bot_config (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+    conn.commit()
 
 
 def get_config(key: str, default: str) -> str:
-    with sqlite3.connect("routine.db") as conn:
-        row = conn.execute("SELECT value FROM bot_config WHERE key=?", (key,)).fetchone()
-        return row[0] if row else default
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM bot_config WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
 
 
 def log_step(step_name: str, status: str) -> None:
-    with sqlite3.connect("routine.db") as conn:
-        conn.execute(
-            "INSERT INTO daily_log (date, step_name, status, logged_at) VALUES (?,?,?,?)",
-            (str(date.today()), step_name, status, datetime.now().strftime("%H:%M")),
-        )
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO daily_log (date, step_name, status, logged_at) VALUES (?,?,?,?)",
+        (str(date.today()), step_name, status, datetime.now().strftime("%H:%M")),
+    )
+    conn.commit()
 
 
 def get_today_log() -> list:
-    with sqlite3.connect("routine.db") as conn:
-        return conn.execute(
-            "SELECT step_name, status FROM daily_log WHERE date=?",
-            (str(date.today()),),
-        ).fetchall()
+    conn = get_conn()
+    return conn.execute(
+        "SELECT step_name, status FROM daily_log WHERE date=?",
+        (str(date.today()),),
+    ).fetchall()
 
 
 def init_tasks_for_today() -> None:
     today = str(date.today())
-    with sqlite3.connect("routine.db") as conn:
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM study_tasks WHERE date=?", (today,)
-        ).fetchone()[0]
-        if existing == 0:
-            for task in DAILY_STUDY_TASKS:
-                conn.execute(
-                    "INSERT INTO study_tasks (date, task_name, duration_mins, status, original_date) "
-                    "VALUES (?,?,?,?,?)",
-                    (today, task["name"], task["minutes"], "pending", today),
-                )
+    conn = get_conn()
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM study_tasks WHERE date=?", (today,)
+    ).fetchone()[0]
+    if existing == 0:
+        for task in DAILY_STUDY_TASKS:
+            conn.execute(
+                "INSERT INTO study_tasks (date, task_name, duration_mins, status, original_date) "
+                "VALUES (?,?,?,?,?)",
+                (today, task["name"], task["minutes"], "pending", today),
+            )
+        conn.commit()
 
 
 def get_today_tasks() -> list:
-    with sqlite3.connect("routine.db") as conn:
-        return conn.execute(
-            "SELECT id, task_name, duration_mins, status FROM study_tasks WHERE date=? ORDER BY id",
-            (str(date.today()),),
-        ).fetchall()
+    conn = get_conn()
+    return conn.execute(
+        "SELECT id, task_name, duration_mins, status FROM study_tasks WHERE date=? ORDER BY id",
+        (str(date.today()),),
+    ).fetchall()
 
 
 def update_task_status(task_id: int, status: str) -> None:
-    with sqlite3.connect("routine.db") as conn:
-        conn.execute("UPDATE study_tasks SET status=? WHERE id=?", (status, task_id))
+    conn = get_conn()
+    conn.execute("UPDATE study_tasks SET status=? WHERE id=?", (status, task_id))
+    conn.commit()
 
 
 def carry_forward_pending() -> int:
     today    = str(date.today())
     tomorrow = str(date.today() + timedelta(days=1))
     carried  = 0
-    with sqlite3.connect("routine.db") as conn:
-        pending = conn.execute(
-            "SELECT task_name, duration_mins, original_date FROM study_tasks "
-            "WHERE date=? AND status IN ('pending', 'not_done')",
-            (today,),
-        ).fetchall()
-        for task_name, duration_mins, original_date in pending:
-            already = conn.execute(
-                "SELECT COUNT(*) FROM study_tasks WHERE date=? AND task_name=?",
-                (tomorrow, task_name),
-            ).fetchone()[0]
-            if not already:
-                conn.execute(
-                    "INSERT INTO study_tasks (date, task_name, duration_mins, status, original_date) "
-                    "VALUES (?,?,?,?,?)",
-                    (tomorrow, task_name, duration_mins, "pending", original_date),
-                )
-                carried += 1
+    conn = get_conn()
+
+    pending = conn.execute(
+        "SELECT task_name, duration_mins, original_date FROM study_tasks "
+        "WHERE date=? AND status IN ('pending', 'not_done')",
+        (today,),
+    ).fetchall()
+
+    for task_name, duration_mins, original_date in pending:
+        already = conn.execute(
+            "SELECT COUNT(*) FROM study_tasks WHERE date=? AND task_name=?",
+            (tomorrow, task_name),
+        ).fetchone()[0]
+        if not already:
+            conn.execute(
+                "INSERT INTO study_tasks (date, task_name, duration_mins, status, original_date) "
+                "VALUES (?,?,?,?,?)",
+                (tomorrow, task_name, duration_mins, "pending", original_date),
+            )
+            carried += 1
+
+    conn.commit()
     return carried
 
 
 def reset_today() -> None:
     """Wipe today's log + tasks so you can re-test cleanly."""
     today = str(date.today())
-    with sqlite3.connect("routine.db") as conn:
-        conn.execute("DELETE FROM daily_log WHERE date=?", (today,))
-        conn.execute("DELETE FROM study_tasks WHERE date=?", (today,))
+    conn = get_conn()
+    conn.execute("DELETE FROM daily_log WHERE date=?", (today,))
+    conn.execute("DELETE FROM study_tasks WHERE date=?", (today,))
+    conn.commit()
 
 
 # ──────────────────────────────────────────────────────
@@ -282,7 +303,6 @@ async def afternoon_checkin(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not tasks:
         return
 
-    # FIX: include both 'pending' and 'not_done' — not_done tasks were vanishing before
     incomplete = [(i, t) for i, t in enumerate(tasks, 1) if t[3] in ("pending", "not_done")]
     done       = [t for t in tasks if t[3] == "done"]
 
@@ -346,7 +366,7 @@ async def evening_report_trigger(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ──────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        f"👋 *Routine Bot — Phase 2 (fixed)*\n\n"
+        f"👋 *Routine Bot — Phase 2 (Turso edition)*\n\n"
         f"Your Chat ID: `{update.effective_chat.id}`\n\n"
         f"*Routine:*\n`/setday normal|exam|holiday`\n`/done` `/notdone`\n`/startmorning` — test now\n\n"
         f"*Study Tasks:*\n`/tasks` `/td 1 2` `/tn 2`\n\n"
@@ -362,9 +382,9 @@ async def cmd_setday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if arg not in valid:
         await update.message.reply_text("Usage: /setday normal|exam|holiday")
         return
-    set_config("day_type", arg)   # FIX: now persists in DB, survives restarts
+    set_config("day_type", arg)
     emoji = {"normal": "📚", "exam": "✏️", "holiday": "🎉"}[arg]
-    await update.message.reply_text(f"{emoji} Day type → *{arg.upper()}* (saved — survives restarts now)", parse_mode="Markdown")
+    await update.message.reply_text(f"{emoji} Day type → *{arg.upper()}* (saved to cloud DB)", parse_mode="Markdown")
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -386,12 +406,10 @@ async def cmd_startmorning(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cmd_testevening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """NEW: manually fire the evening report without waiting for real clock time."""
     await evening_report_trigger(context)
 
 
 async def cmd_resetday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """NEW: wipe today's log + tasks for a clean re-test."""
     reset_today()
     context.bot_data["routine_active"] = False
     await update.message.reply_text("🧹 Today's data wiped. Run /startmorning to test fresh.")
@@ -494,6 +512,8 @@ def main() -> None:
         raise ValueError("TELEGRAM_TOKEN not found — check your .env file")
     if not CHAT_ID:
         raise ValueError("CHAT_ID not found — run /start in Telegram first")
+    if not TURSO_URL or not TURSO_TOKEN:
+        raise ValueError("TURSO_DATABASE_URL / TURSO_AUTH_TOKEN not found — check your .env file")
 
     init_db()
     app = Application.builder().token(TOKEN).build()
@@ -519,7 +539,7 @@ def main() -> None:
     jq.run_daily(afternoon_checkin,      time=time(hour=AFT_HOUR,  minute=AFT_MINUTE,  tzinfo=TIMEZONE))
     jq.run_daily(evening_report_trigger, time=time(hour=EVE_HOUR,  minute=EVE_MINUTE,  tzinfo=TIMEZONE))
 
-    logger.info("🤖 RoutineBot Phase 2 (fixed) running...")
+    logger.info("🤖 RoutineBot Phase 2 (Turso) running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
